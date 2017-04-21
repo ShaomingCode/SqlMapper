@@ -1,0 +1,166 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Data.SqlClient;
+using System.Reflection.Emit;
+using System.Collections.Concurrent;
+using System.Data;
+using System.Reflection;
+
+namespace SqlMapper
+{
+    static class SqlMapper
+    {
+
+        static ConcurrentDictionary<Tuple<string, Type>, object> cachedSerializers = new ConcurrentDictionary<Tuple<string, Type>, object>();
+
+        static Dictionary<Type, SqlDbType> typeMap;
+
+        static TrivialMapper()
+        {
+            typeMap = new Dictionary<Type, SqlDbType>();
+            typeMap[typeof(int)] = SqlDbType.Int;
+            typeMap[typeof(int?)] = SqlDbType.Int;
+        }
+
+
+        public static IEnumerable<T> ExecuteQuery<T, U>(this SqlConnection cnn, string sql, U param)
+        {
+            var identity = Tuple.Create(sql, typeof(T));
+            var rval = new List<T>();
+
+            using (var reader = GetReader(cnn, sql, param))
+            {
+                object oDeserializer;
+                if (!cachedSerializers.TryGetValue(identity, out oDeserializer))
+                {
+                    oDeserializer = GetDeserializer<T>(reader);
+                    cachedSerializers[identity] = oDeserializer;
+                }
+                Func<SqlDataReader, T> deserializer = (Func<SqlDataReader, T>)oDeserializer;
+                while (reader.Read())
+                {
+                    rval.Add(deserializer(reader));
+                }
+            }
+
+            return rval;
+        }
+
+        private static DynamicMethod GetDynamicReader<T, U>(SqlConnection cnn, string sql, U param)
+        {
+            DynamicMethod dm = new DynamicMethod("Persist" + Guid.NewGuid().ToString(), typeof(IEnumerable<T>), new Type[] { typeof(U) });
+            var il = dm.GetILGenerator();
+
+            var cmd = il.DeclareLocal(typeof(SqlCommand));
+            var reader = il.DeclareLocal(typeof(SqlDataReader));
+            var sqlParam = il.DeclareLocal(typeof(SqlParameter));
+
+            il.Emit(OpCodes.Newobj, typeof(SqlCommand).GetConstructor(Type.EmptyTypes));
+            il.Emit(OpCodes.Stloc_S, cmd);
+            il.Emit(OpCodes.Ldloca_S, cmd);
+            il.Emit(OpCodes.Ldloc_1);
+
+
+            return dm;
+        }
+
+        private static SqlDataReader GetReader<T>(SqlConnection cnn, string sql, T param)
+        {
+            sql = string.Format(sql, "@a");
+            var cmd = cnn.CreateCommand();
+            cmd.CommandText = sql;
+            var p = cmd.Parameters.Add("@a", typeMap[typeof(T)]);
+            p.Value = param;
+            var reader = cmd.ExecuteReader();
+            cmd.Dispose();
+
+            return reader;
+        }
+
+
+        public static Func<SqlDataReader, T> GetDeserializer<T>(SqlDataReader reader)
+        {
+            DynamicMethod dm = new DynamicMethod("Deserialize" + Guid.NewGuid().ToString(), typeof(T), new Type[] { typeof(SqlDataReader) }, true);
+
+            var il = dm.GetILGenerator();
+
+            var properties = typeof(T)
+                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .Select(p => new { Name = p.Name, Setter = p.GetSetMethod(), Type = p.PropertyType })
+                .Where(info => info.Setter != null)
+                .ToList();
+
+            var names = new List<string>();
+            for (int i = 0; i < reader.FieldCount; i++)
+            {
+                names.Add(reader.GetName(i));
+            }
+
+            var setters = (from n in names select new { Name = n, Info = properties.FirstOrDefault(p => p.Name == n) }).ToList();
+
+
+            var post = il.DeclareLocal(typeof(T));
+            il.Emit(OpCodes.Newobj, typeof(T).GetConstructor(Type.EmptyTypes));
+            il.Emit(OpCodes.Stloc, post);
+
+            var dbnull = il.DeclareLocal(typeof(DBNull));
+
+            var fieldInfo = typeof(DBNull).GetField("Value", BindingFlags.Static | BindingFlags.Public);
+            il.Emit(OpCodes.Ldsfld, fieldInfo);
+            il.Emit(OpCodes.Stloc, dbnull);
+
+
+            var getItem = typeof(SqlDataReader).GetProperties(BindingFlags.Instance | BindingFlags.Public)
+                         .Where(p => p.GetIndexParameters().Any() && p.GetIndexParameters()[0].ParameterType == typeof(int))
+                         .Select(p => p.GetGetMethod()).First();
+
+            int index = -1;
+
+            Label isNullLabel;
+            Label finishLabel;
+
+            foreach (var item in setters)
+            {
+                // a bit hacky, but helps during debugging, cause it allows me to sprinkle continues
+                index += 1;
+
+                if (item.Info != null)
+                {
+
+                    isNullLabel = il.DefineLabel();
+                    finishLabel = il.DefineLabel();
+
+                    il.Emit(OpCodes.Ldarg_0);
+                    il.Emit(OpCodes.Ldc_I4, index);
+                    il.Emit(OpCodes.Callvirt, getItem);
+
+                    // we need this on the stack 
+                    var tmp = il.DeclareLocal(typeof(object));
+                    il.Emit(OpCodes.Stloc, tmp);
+                    il.Emit(OpCodes.Ldloc, tmp);
+
+                    il.Emit(OpCodes.Ldloc, dbnull);
+                    il.Emit(OpCodes.Beq, isNullLabel);
+
+                    il.Emit(OpCodes.Ldloc, post);
+                    il.Emit(OpCodes.Ldloc, tmp);
+                    il.Emit(OpCodes.Unbox_Any, item.Info.Type);
+                    il.Emit(OpCodes.Callvirt, item.Info.Setter);
+
+                    il.Emit(OpCodes.Br, finishLabel);
+                    il.MarkLabel(isNullLabel);
+                    il.MarkLabel(finishLabel);
+                }
+            }
+
+            il.Emit(OpCodes.Ldloc, post);
+            il.Emit(OpCodes.Ret);
+
+
+            return (Func<SqlDataReader, T>)dm.CreateDelegate(typeof(Func<SqlDataReader, T>));
+        }
+
+    }
+}
